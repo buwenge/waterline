@@ -1,0 +1,35 @@
+{
+  "name": "waterline",
+  "version": "0.1.0",
+  "description": "可收起的侧栏模组。第一个模组「水位线」：上下文、5 小时额度、周额度涨到你设的线时，自动发一句你写好的话给 Claude（正在干活就插进当前这一轮）",
+  "types": "./types/index.d.ts",
+  "author": {
+    "name": "buwenge"
+  },
+  "license": "MIT",
+  "repository": "https://github.com/buwenge/waterline",
+  "homepage": "https://github.com/buwenge/waterline",
+  "keywords": [
+    "mod",
+    "waterline",
+    "context",
+    "rate-limit",
+    "quota",
+    "alert"
+  ],
+  "userConfig": {
+    "timeZone": {
+      "type": "string",
+      "title": "时区",
+      "description": "侧栏里「已存 HH:MM」用的时区，IANA 名，如 Asia/Shanghai；留空用机器的时区",
+      "default": ""
+    },
+    "ignoreDirs": {
+      "type": "string",
+      "multiple": true,
+      "title": "不生效的目录",
+      "description": "在这些目录（及其子目录）里开的会话不盯线、不发话",
+      "default": []
+    }
+  }
+}

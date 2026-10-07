@@ -1,0 +1,14 @@
+{
+  "name": "waterline",
+  "description": "Claude Code 侧栏 mod：水位线（到线提醒）等",
+  "owner": {
+    "name": "buwenge"
+  },
+  "plugins": [
+    {
+      "name": "waterline",
+      "source": "./",
+      "description": "可收起的侧栏模组；水位线：上下文、5 小时额度、周额度到线时，自动发一句你写好的话给 Claude"
+    }
+  ]
+}
