@@ -6,7 +6,7 @@ import type {
   SessionRateLimit,
 } from 'claude-code'
 
-import type { Armed, LineConfig, LineDraft, LineKey, Reading } from '../types'
+import type { ApiQuota, Armed, LineConfig, LineDraft, LineKey, Reading } from '../types'
 
 const PANE = 'waterline'
 const STORE_KEY = 'line-config'
@@ -20,6 +20,7 @@ const DEFAULT_CONFIG: LineConfig = {
   ctxMsg: '上下文到线了，写好交接就停下等我。',
   fiveH: null,
   week: null,
+  fable: null,
   quotaMsg: '额度到线了，写好交接就停下等我。',
 }
 
@@ -32,6 +33,7 @@ const armed = atom({ plugin: 'waterline', key: 'armed' } as const, {
   ctx: false,
   fiveH: false,
   week: false,
+  fable: false,
 })
 const flow = atom({ plugin: 'waterline', key: 'flow' } as const, { turn: null, pending: null })
 const lastSent = atom({ plugin: 'waterline', key: 'lastSent' } as const, '')
@@ -46,7 +48,7 @@ const isLive = atom({ plugin: 'waterline', key: 'isLive' } as const, false)
  */
 const saves = atom({ plugin: 'waterline', key: 'saves' } as const, 0)
 
-const KEYS: readonly LineKey[] = ['ctx', 'fiveH', 'week']
+const KEYS: readonly LineKey[] = ['ctx', 'fiveH', 'week', 'fable']
 
 /**
  * 输入框里敲着还没保存的字，按保存时用。输入框的 value 一直给"存着的值"、不跟着敲的字变：
@@ -57,6 +59,14 @@ let typed: Partial<LineDraft> | undefined
 
 /** 两句话正在敲的全文：输入框只显示开头一行，框下面用它实时显示整句 */
 const live = atom({ plugin: 'waterline', key: 'live' } as const, {})
+
+/** 这个窗口主线程当前用的模型（每一步请求都带着），Fable 那条线只发给 Fable 窗口 */
+const model = atom({ plugin: 'waterline', key: 'model' } as const, '')
+
+/** 没填额度文件时，Fable 周线问官方额度接口（每个窗口最多 5 分钟问一次，不花 token） */
+const apiQuota = atom({ plugin: 'waterline', key: 'apiQuota' } as const, { nextAt: 0 } as ApiQuota)
+const USAGE_API = 'https://api.anthropic.com/api/oauth/usage'
+const POLL_MS = 5 * 60_000
 
 // ---------- 纯函数（测试直接覆盖） ----------
 
@@ -70,6 +80,7 @@ export function toDraft(c: LineConfig): LineDraft {
     ctxMsg: c.ctxMsg,
     fiveH: numText(c.fiveH),
     week: numText(c.week),
+    fable: numText(c.fable),
     quotaMsg: c.quotaMsg,
   }
 }
@@ -96,6 +107,8 @@ export function parseDraft(
   if (fiveH === undefined) return { error: '5小时额度要填 1～100，不盯就留空' }
   const week = parseNum(d.week, 100)
   if (week === undefined) return { error: '周额度要填 1～100，不盯就留空' }
+  const fable = parseNum(d.fable, 100)
+  if (fable === undefined) return { error: 'Fable 周额度要填 1～100，不盯就留空' }
 
   return {
     config: {
@@ -104,6 +117,7 @@ export function parseDraft(
       ctxMsg: d.ctxMsg.trim(),
       fiveH,
       week,
+      fable,
       quotaMsg: d.quotaMsg.trim(),
     },
   }
@@ -122,6 +136,7 @@ export function normalizeConfig(raw: unknown): LineConfig {
     ctxMsg: str(v.ctxMsg, DEFAULT_CONFIG.ctxMsg),
     fiveH: num(v.fiveH),
     week: num(v.week),
+    fable: num(v.fable),
     quotaMsg: str(v.quotaMsg, DEFAULT_CONFIG.quotaMsg),
   }
 }
@@ -137,14 +152,67 @@ export function readingOf(context: SessionContextUsage, limits: SessionRateLimit
   }
 }
 
+/**
+ * Fable 周额度：Claude Code 不交给插件（实测：跑 Fable 的会话里插件也只拿到 five_hour / seven_day），
+ * 它只出现在跑 Fable 的请求回包里。自己有办法把它记成文件的（比如跑 Fable 时顺手记），填上文件路径就能读：
+ * `{ "windows": { "seven_day_overage_included": { "utilization": 27, "at": <秒> } } }`
+ */
+export function parseQuotaFile(text: string): Pick<Reading, 'fable' | 'fableAt' | 'fableNote'> {
+  let data: unknown
+  try {
+    data = JSON.parse(text)
+  } catch {
+    return { fableNote: '额度文件不是 JSON' }
+  }
+  const windows = (data as { windows?: Record<string, { utilization?: unknown; at?: unknown }> })?.windows
+  const w = windows?.seven_day_overage_included
+  if (w === undefined || typeof w.utilization !== 'number') return { fableNote: '额度文件里还没有 Fable 那条' }
+  return { fable: w.utilization, fableAt: typeof w.at === 'number' ? w.at * 1000 : undefined }
+}
+
+/**
+ * 官方额度接口（Claude Code 的 /usage 背后那个，免费）回包里找 Fable 专属周线。
+ * 认两种写法：limits[] 里 kind=weekly_scoped、scope.model.display_name 含 Fable 的 percent（2026-09 前实测），
+ * 或顶层 seven_day_overage_included.utilization（模型回包头里的叫法）。
+ */
+export function parseUsageApi(text: string): Pick<Reading, 'fable' | 'fableNote'> {
+  let data: {
+    seven_day_overage_included?: { utilization?: unknown }
+    limits?: { kind?: unknown; percent?: unknown; scope?: { model?: { display_name?: unknown } } }[]
+  }
+  try {
+    data = JSON.parse(text)
+  } catch {
+    return { fableNote: '额度接口回的不是 JSON' }
+  }
+  const top = data?.seven_day_overage_included?.utilization
+  if (typeof top === 'number') return { fable: top }
+  for (const lim of Array.isArray(data?.limits) ? data.limits : []) {
+    const name = lim?.scope?.model?.display_name
+    if (lim?.kind === 'weekly_scoped' && typeof name === 'string' && /fable/i.test(name) && typeof lim.percent === 'number') {
+      return { fable: lim.percent }
+    }
+  }
+  return { fableNote: '额度接口里没有 Fable 那条（这个账号可能没有 Fable 专属周线）' }
+}
+
+export function isFableModel(model: string | undefined): boolean {
+  return /fable/i.test(model ?? '')
+}
+
+/** Fable 那条线只对正在跑 Fable 的窗口算：别的窗口当它没读数，不上膛也不发 */
+export function forArming(r: Reading): Reading {
+  return isFableModel(r.model) ? r : { ...r, fable: undefined }
+}
+
 /** 上下文按 k 比，额度按 % 比 */
 function valueOf(r: Reading, key: LineKey): number | undefined {
   if (key === 'ctx') return r.ctxTokens === undefined ? undefined : r.ctxTokens / 1000
-  return key === 'fiveH' ? r.fiveH : r.week
+  return key === 'fiveH' ? r.fiveH : key === 'week' ? r.week : r.fable
 }
 
 function lineOf(c: LineConfig, key: LineKey): number | null {
-  return key === 'ctx' ? c.ctxK : key === 'fiveH' ? c.fiveH : c.week
+  return key === 'ctx' ? c.ctxK : key === 'fiveH' ? c.fiveH : key === 'week' ? c.week : c.fable
 }
 
 export function isOver(c: LineConfig, r: Reading, key: LineKey): boolean {
@@ -186,7 +254,7 @@ export function rearm(c: LineConfig, r: Reading): Armed {
     return v !== undefined && line !== null && v < line
   }
 
-  return { ctx: isBelow('ctx'), fiveH: isBelow('fiveH'), week: isBelow('week') }
+  return { ctx: isBelow('ctx'), fiveH: isBelow('fiveH'), week: isBelow('week'), fable: isBelow('fable') }
 }
 
 /** 终端里占几格：中日韩和全角符号算两格 */
@@ -248,7 +316,11 @@ export function composeMessages(c: LineConfig, r: Reading, crossed: LineKey[]): 
   const quota = crossed
     .filter(key => key !== 'ctx')
     .map(key =>
-      key === 'fiveH' ? `5小时额度 ${r.fiveH}%（线 ${c.fiveH}%）` : `周额度 ${r.week}%（线 ${c.week}%）`,
+      key === 'fiveH'
+        ? `5小时额度 ${r.fiveH}%（线 ${c.fiveH}%）`
+        : key === 'week'
+          ? `周额度 ${r.week}%（线 ${c.week}%）`
+          : `Fable 周额度 ${r.fable}%（线 ${c.fable}%）`,
     )
   if (quota.length > 0 && c.quotaMsg !== '') {
     out.push(`【到线提醒】${quota.join('、')}。${c.quotaMsg}`)
@@ -275,7 +347,11 @@ export function clockText(ms: number, timeZone: string): string {
 }
 
 /** 插件设置（plugin.json 的 userConfig），register 时填进来 */
-let settings: { timeZone: string; ignoreDirs: readonly string[] } = { timeZone: '', ignoreDirs: [] }
+let settings: { timeZone: string; ignoreDirs: readonly string[]; quotaFile: string } = {
+  timeZone: '',
+  ignoreDirs: [],
+  quotaFile: '',
+}
 
 function hhmm(ms: number): string {
   return clockText(ms, settings.timeZone)
@@ -301,13 +377,20 @@ async function syncConfig($: EngineInterface): Promise<LineConfig> {
   if (JSON.stringify(fresh) !== JSON.stringify(held)) {
     await update($, config, () => fresh)
     const r = await read($, reading)
-    await update($, armed, () => rearm(fresh, r))
+    await update($, armed, () => rearm(fresh, forArming(r)))
   }
   return fresh
 }
 
 async function openPane($: EngineInterface) {
   await syncConfig($)
+  if (settings.quotaFile === '') {
+    try {
+      await pollUsageApi($)
+    } catch (err) {
+      $.ui.toast(`问额度接口出错：${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
   await update($, isOpen, () => true)
   const opened = await $.ui.open({ id: PANE, title: '模组', columns: 46, rows: 22 })
   if (!opened.isPlaced) $.ui.toast(`模组栏没摆出来：${opened.reason}`)
@@ -323,7 +406,7 @@ async function commit($: EngineInterface, next: LineConfig) {
   await $.store.set(STORE_KEY, next)
   await update($, config, () => next)
   const r = await read($, reading)
-  await update($, armed, () => rearm(next, r))
+  await update($, armed, () => rearm(next, forArming(r)))
 }
 
 /** 存全部格子；填错了返回原因（不存），存好返回 null */
@@ -426,7 +509,71 @@ async function deliver($: EngineInterface, text: string, canInsert: boolean) {
   return '已插进当前这一轮'
 }
 
-async function observe($: EngineInterface, r: Reading, canInsert = true) {
+/**
+ * 到点了就问一次官方额度接口，结果记进 apiQuota。凭据由引擎代为挂上，插件拿不到。
+ * 普通登录（/login）问得到；长期令牌（setup-token）会被拒，那就半天后再试、并说清原因。
+ */
+async function pollUsageApi($: EngineInterface) {
+  const now = await $.clock.now()
+  if (now < (await read($, apiQuota)).nextAt) return
+  const keep = (await read($, apiQuota)).fable
+  const settle = (next: ApiQuota) => update($, apiQuota, () => next)
+
+  const auth = await $.session.authorize()
+  if (auth === null) {
+    await settle({ fableNote: '这个会话没有 Anthropic 登录凭据，问不到额度接口', nextAt: now + 6 * 3_600_000 })
+    return
+  }
+  let res: Awaited<ReturnType<EngineInterface['http']['fetch']>>
+  try {
+    res = await $.http.fetch(USAGE_API, {
+      auth: auth.handle,
+      headers: { Accept: 'application/json', 'anthropic-beta': 'oauth-2025-04-20' },
+    })
+  } catch (err) {
+    await settle({ fable: keep, fableNote: `额度接口没问成：${err instanceof Error ? err.message : String(err)}`, nextAt: now + POLL_MS })
+    return
+  }
+  if (res.status === 429) {
+    const wait = Number(res.headers['retry-after'])
+    const ms = Number.isFinite(wait) && wait > 0 ? wait * 1000 : 15 * 60_000
+    await settle({
+      fable: keep,
+      fableNote: `额度接口限流（长期令牌 setup-token 常见），${Math.ceil(ms / 60_000)} 分钟后再问；可以在设置里填额度文件`,
+      nextAt: now + ms,
+    })
+  } else if (res.status === 401 || res.status === 403) {
+    await settle({
+      fableNote: '这种登录方式问不到额度接口（长期令牌 setup-token 就是这样），可以在设置里填额度文件',
+      nextAt: now + 6 * 3_600_000,
+    })
+  } else if (!res.ok) {
+    await settle({ fable: keep, fableNote: `额度接口回了 ${res.status}`, nextAt: now + POLL_MS })
+  } else {
+    await settle({ ...parseUsageApi(res.text), fableAt: now, nextAt: now + POLL_MS })
+  }
+}
+
+/** Claude Code 给的读数，再并上 Fable（额度文件优先，没填就问官方接口）和这个窗口的模型 */
+async function withExtras($: EngineInterface, base: Reading): Promise<Reading> {
+  const current = await read($, model)
+  if (settings.quotaFile === '') {
+    const c = await read($, config)
+    if (c.enabled && c.fable !== null) await pollUsageApi($)
+    const { fable, fableAt, fableNote } = await read($, apiQuota)
+    return { ...base, fable, fableAt, fableNote, model: current }
+  }
+  let extra: Pick<Reading, 'fable' | 'fableAt' | 'fableNote'>
+  try {
+    extra = parseQuotaFile(String(await $.fs.read(settings.quotaFile)))
+  } catch (err) {
+    extra = { fableNote: `读不到额度文件：${err instanceof Error ? err.message : String(err)}` }
+  }
+  return { ...base, ...extra, model: current }
+}
+
+async function observe($: EngineInterface, base: Reading, canInsert = true) {
+  const r = await withExtras($, base)
   await update($, reading, () => r)
   if (!(await read($, isLive))) return
   const c = await syncConfig($)
@@ -434,7 +581,7 @@ async function observe($: EngineInterface, r: Reading, canInsert = true) {
 
   let crossed: LineKey[] = []
   await update($, armed, a => {
-    const stepped = stepArmed(a, c, r)
+    const stepped = stepArmed(a, c, forArming(r))
     crossed = stepped.crossed
     return stepped.armed
   })
@@ -466,6 +613,7 @@ export const register: Register = (on, options) => {
   settings = {
     timeZone: typeof options.timeZone === 'string' ? options.timeZone.trim() : '',
     ignoreDirs: Array.isArray(options.ignoreDirs) ? options.ignoreDirs : [],
+    quotaFile: typeof options.quotaFile === 'string' ? options.quotaFile.trim() : '',
   }
 
   on('session.start', async ($, e, next) => {
@@ -528,6 +676,7 @@ export const register: Register = (on, options) => {
   on('turn.step', async function* ($, e, next) {
     if (e.agentId !== undefined) return yield* next(e)
 
+    await update($, model, () => e.model)
     await update($, flow, f => {
       const turn = f.turn !== null && f.turn.id === e.turnId ? { ...f.turn, step: e.index } : f.turn
       const isSeen = f.pending !== null && f.pending.turnId === e.turnId && e.index > f.pending.step
@@ -653,7 +802,7 @@ export const register: Register = (on, options) => {
       const pct = (v: number | undefined) => (v === undefined ? '?' : `${v}%`)
       const ctxNow = r.ctxTokens === undefined ? '还没读数' : `${k(r.ctxTokens)}k / ${k(r.ctxWindow)}k`
       const overNote = (isPast: boolean) => (c.enabled && isPast ? '已过线 · ' : '')
-      const hasLine = c.ctxK !== null || c.fiveH !== null || c.week !== null
+      const hasLine = c.ctxK !== null || c.fiveH !== null || c.week !== null || c.fable !== null
 
       if (!('Input' in els)) {
         rows.push(
@@ -661,6 +810,7 @@ export const register: Register = (on, options) => {
             <Text dimColor>上下文 现在 {ctxNow}</Text>
             <Text dimColor>
               额度 现在 5小时 {pct(r.fiveH)} · 周 {pct(r.week)}
+              {r.fable === undefined ? '' : ` · Fable 周 ${pct(r.fable)}`}
             </Text>
             <Text dimColor>这个界面不能填，回终端里改。</Text>
           </Box>,
@@ -720,18 +870,35 @@ export const register: Register = (on, options) => {
       const bigButton = (key: MessageKey) => (
         <Button key={`big-${key}`} plain dimColor label="✎ 大框里改" onPress={() => editInPrompt($, key)} />
       )
-      // 额度一根条：名字、条、现在多少
-      const quotaMeter = (label: string, value: number | undefined, line: number | null) => (
+      // 额度一行：名字、细条、现在多少、[线]——竖线画在你填的那个数上
+      const quotaRow = (label: string, value: number | undefined, key: 'fiveH' | 'week' | 'fable') => (
         <Box>
           <Box width={6}>
             <Text dimColor>{label}</Text>
           </Box>
-          {meter(value, line, 100, inner - 11)}
+          {meter(value, c[key], 100, inner - 25)}
           <Box width={5} justifyContent="flex-end">
             <Text dimColor>{pct(value)}</Text>
           </Box>
+          <Text dimColor> [ </Text>
+          <Box width={9}>{field(key, '不盯')}</Box>
+          <Text dimColor>]</Text>
         </Box>
       )
+      const api = await read($, apiQuota)
+      const shown = settings.quotaFile === '' ? { ...r, fable: api.fable, fableAt: api.fableAt, fableNote: api.fableNote } : r
+      const hasFable = settings.quotaFile !== '' || shown.fable !== undefined || c.fable !== null
+      const fableAge = shown.fableAt === undefined ? 0 : (await $.clock.now()) - shown.fableAt
+      const fableHint =
+        shown.fableNote !== undefined
+          ? `Fable：${shown.fableNote}`
+          : `Fable 那条只发给跑 Fable 的窗口${
+              fableAge >= 3_600_000
+                ? ` · ${Math.round(fableAge / 3_600_000)} 小时前的数`
+                : fableAge >= 600_000
+                  ? ` · ${Math.round(fableAge / 60_000)} 分钟前的数`
+                  : ''
+            }`
 
       rows.push(
         <Box flexDirection="column" paddingLeft={2}>
@@ -748,15 +915,16 @@ export const register: Register = (on, options) => {
               <Text bold>额度</Text>
               <Text dimColor>
                 {'  '}
-                {overNote(isOver(c, r, 'fiveH') || isOver(c, r, 'week'))}任一条到线就发
+                {overNote(isOver(c, r, 'fiveH') || isOver(c, r, 'week') || isOver(c, forArming(r), 'fable'))}
+                任一条到线就发
               </Text>
             </Text>
             {bigButton('quotaMsg')}
           </Box>
-          {quotaMeter('5小时', r.fiveH, c.fiveH)}
-          {quotaMeter('周', r.week, c.week)}
-          {numberRow('5小时到', 'fiveH', ' %')}
-          {numberRow('周额度到', 'week', ' %')}
+          {quotaRow('5小时', r.fiveH, 'fiveH')}
+          {quotaRow('周', r.week, 'week')}
+          {hasFable && quotaRow('Fable', shown.fable, 'fable')}
+          {hasFable && <Text dimColor>{fableHint}</Text>}
           {message('quotaMsg')}
           {c.enabled && !hasLine && <Text dimColor>还没填线，开着也不会发</Text>}
           {sent !== '' && (

@@ -30,6 +30,12 @@
       "title": "不生效的目录",
       "description": "在这些目录（及其子目录）里开的会话不盯线、不发话",
       "default": []
+    },
+    "quotaFile": {
+      "type": "string",
+      "title": "额度文件（可选）",
+      "description": "Fable 周额度：普通登录会自动问官方额度接口；长期令牌（setup-token）问不到，可以填一个记着它的 JSON 文件（windows.seven_day_overage_included.utilization / at），填了就优先读文件",
+      "default": ""
     }
   }
 }

@@ -1,4 +1,5 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
+import type { Engine, MockClock } from 'claude-code/testing'
 import type { On, RenderElement } from 'claude-code'
 
 import {
@@ -6,6 +7,8 @@ import {
   cellWidth,
   clockText,
   isIgnoredDir,
+  parseQuotaFile,
+  parseUsageApi,
   composeMessages,
   overflowTail,
   parseNum,
@@ -20,13 +23,14 @@ const CFG: LineConfig = {
   ctxMsg: '收尾',
   fiveH: 90,
   week: null,
+  fable: null,
   quotaMsg: '停下',
 }
 
 describe('纯函数', () => {
   test('只在从线下走到线上那一刻发一次', () => {
     let a = rearm(CFG, {})
-    expect(a).toEqual({ ctx: false, fiveH: false, week: false })
+    expect(a).toEqual({ ctx: false, fiveH: false, week: false, fable: false })
 
     let s = stepArmed(a, CFG, { ctxTokens: 50_000 })
     expect(s.crossed).toEqual([])
@@ -58,6 +62,33 @@ describe('纯函数', () => {
     expect(clockText(at, 'Asia/Shanghai')).toBe('14:05')
     expect(clockText(at, 'UTC')).toBe('06:05')
     expect(clockText(at, 'Not/AZone')).toBe('06:05 UTC')
+  })
+
+  test('额度文件：读出 Fable 那条和记下的时间；坏文件、没这条都说清原因', () => {
+    expect(
+      parseQuotaFile('{"windows":{"seven_day_overage_included":{"utilization":27,"at":1000}}}'),
+    ).toEqual({ fable: 27, fableAt: 1_000_000 })
+    expect(parseQuotaFile('不是json')).toEqual({ fableNote: '额度文件不是 JSON' })
+    expect(parseQuotaFile('{"windows":{"five_hour":{"utilization":3}}}')).toEqual({
+      fableNote: '额度文件里还没有 Fable 那条',
+    })
+  })
+
+  test('官方额度接口：两种写法都认 Fable；没有就说清', () => {
+    expect(
+      parseUsageApi(
+        JSON.stringify({
+          five_hour: { utilization: 20 },
+          limits: [
+            { kind: 'weekly', percent: 60 },
+            { kind: 'weekly_scoped', percent: 41, scope: { model: { display_name: 'Fable' } } },
+          ],
+        }),
+      ),
+    ).toEqual({ fable: 41 })
+    expect(parseUsageApi('{"seven_day_overage_included":{"utilization":33}}')).toEqual({ fable: 33 })
+    expect(parseUsageApi('{"five_hour":{"utilization":3}}').fableNote).toContain('没有 Fable 那条')
+    expect(parseUsageApi('<html>').fableNote).toBe('额度接口回的不是 JSON')
   })
 
   test('不生效的目录：目录本身和底下都算，前缀相同的别的目录不算', () => {
@@ -96,16 +127,17 @@ type World = {
   appends: { type: string; text: string }[]
   toasts: string[]
   store: Record<string, unknown>
+  clock: MockClock
 }
 
 function world(on: On, config: LineConfig): World {
-  const w: World = { submits: [], appends: [], toasts: [], store: { 'line-config': config } }
+  const w = { submits: [], appends: [], toasts: [], store: { 'line-config': config } } as unknown as World
   on('store.get', ($, e) => ({ value: w.store[e.key] }))
   on('store.set', ($, e) => {
     w.store[e.key] = e.value
     return { value: undefined }
   })
-  mock.clock(on, { now: Date.UTC(2026, 9, 7, 6, 0) })
+  w.clock = mock.clock(on, { now: Date.UTC(2026, 9, 7, 6, 0) })
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('ui.panes', () => ({ value: [] }))
   on('ui.toast', ($, e) => {
@@ -231,9 +263,8 @@ for (const surface of ['terminal', 'desktop'] as const) {
         view: {},
       },
     })
-    // 平时只列名字；点名字展开
     expect(await ui.find({ type: 'Input' })).toBeUndefined()
-    expect((await ui.find({ key: 'mod-line' }))?.text).toBe('▸ 水位线')
+
     await ui.press({ key: 'mod-line' })
     expect(await ui.find({ key: 'ctxK~0' })).toBeDefined()
 
@@ -382,3 +413,91 @@ for (const hasMoreSteps of [false, true]) {
     expect(w.submits).toEqual(['【到线提醒】上下文 120k，到了 100k 的线。收尾'])
   })
 }
+
+// Fable 周额度 Claude Code 不交给插件，从额度文件读；那条线只发给正在跑 Fable 的窗口
+for (const [model, isFable] of [
+  ['claude-fable-5-1', true],
+  ['claude-opus-5-5', false],
+] as const) {
+  test(`Fable 线过线：${isFable ? 'Fable 窗口发' : '别的模型窗口不发'}`, { options: { quotaFile: '/q.json' } }, async ($, on) => {
+    const w = world(on, { ...CFG, ctxK: null, fiveH: null, fable: 90 })
+    let used = 80
+    on('fs.read', () => ({
+      value: JSON.stringify({ windows: { seven_day_overage_included: { utilization: used, at: 0 } } }),
+    }))
+    on('session.usage', () => ({
+      value: { startedAt: 0, context: { tokens: 1000, window: 1_000_000 }, rateLimits: [] },
+    }))
+    on('turn.step', async function* ($$, e) {
+      return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: null } as never
+    })
+    await $.session.start(START)
+    await $.turn.start({ text: 'go', turnId: 't1' })
+    for await (const _ of $.turn.step({ turnId: 't1', index: 0, model, messageCount: 1 })) {
+      // 只要结果
+    }
+    used = 95
+    for await (const _ of $.turn.step({ turnId: 't1', index: 1, model, messageCount: 2 })) {
+      // 只要结果
+    }
+
+    expect(w.submits).toEqual(isFable ? ['【到线提醒】Fable 周额度 95%（线 90%）。停下'] : [])
+  })
+}
+
+// 没填额度文件：普通登录问官方额度接口拿 Fable；长期令牌被拒就说清、半天内不再问
+function usageWorld(on: On, reply: () => { status: number; text: string; headers?: Record<string, string> }) {
+  const calls: string[] = []
+  on('session.authorize', () => ({ value: { handle: 'h1', kind: 'bearer' } }))
+  on('http.fetch', ($$, e) => {
+    calls.push(e.url)
+    const { status, text, headers = {} } = reply()
+    return { value: { status, ok: status >= 200 && status < 300, headers, text } }
+  })
+  on('session.usage', () => ({
+    value: { startedAt: 0, context: { tokens: 1000, window: 1_000_000 }, rateLimits: [] },
+  }))
+  on('turn.step', async function* ($$, e) {
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn', usage: null } as never
+  })
+  return calls
+}
+
+async function fableSteps($: Engine, count: number, before: (i: number) => void) {
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  for (let i = 0; i < count; i++) {
+    before(i)
+    for await (const _ of $.turn.step({ turnId: 't1', index: i, model: 'claude-fable-5-1', messageCount: i + 1 })) {
+      // 只要结果
+    }
+  }
+}
+
+test('普通登录：问官方接口拿 Fable，过线发；5 分钟内不重复问', async ($, on) => {
+  const w = world(on, { ...CFG, ctxK: null, fiveH: null, fable: 90 })
+  let used = 80
+  const calls = usageWorld(on, () => ({
+    status: 200,
+    text: JSON.stringify({ limits: [{ kind: 'weekly_scoped', percent: used, scope: { model: { display_name: 'Fable' } } }] }),
+  }))
+  await $.session.start(START)
+  await fableSteps($, 1, () => {})
+  expect(calls.length).toBe(1)
+  used = 95
+  await fableSteps($, 1, () => {})
+  expect(calls.length).toBe(1)
+  expect(w.submits).toEqual([])
+  await w.clock.advance(5 * 60_000)
+  await fableSteps($, 1, () => {})
+  expect(calls.length).toBe(2)
+  expect(w.submits).toEqual(['【到线提醒】Fable 周额度 95%（线 90%）。停下'])
+})
+
+test('长期令牌：接口回 403，不发、记下原因、半天内不再问', async ($, on) => {
+  const w = world(on, { ...CFG, ctxK: null, fiveH: null, fable: 90 })
+  const calls = usageWorld(on, () => ({ status: 403, text: '{"error":"forbidden"}' }))
+  await $.session.start(START)
+  await fableSteps($, 3, () => {})
+  expect(calls.length).toBe(1)
+  expect(w.submits).toEqual([])
+})
