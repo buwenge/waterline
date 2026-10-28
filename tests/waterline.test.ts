@@ -130,7 +130,7 @@ type World = {
   clock: MockClock
 }
 
-function world(on: On, config: LineConfig): World {
+function world(on: On, config: LineConfig, opts: { appendOk?: boolean } = {}): World {
   const w = { submits: [], appends: [], toasts: [], store: { 'line-config': config } } as unknown as World
   on('store.get', ($, e) => ({ value: w.store[e.key] }))
   on('store.set', ($, e) => {
@@ -152,10 +152,10 @@ function world(on: On, config: LineConfig): World {
     w.submits.push(e.text)
     return { text: e.text }
   })
-  on('session.append', ($, e) => {
+  on('session.append', ($, e, next) => {
     const block = e.message.content[0]
     w.appends.push({ type: e.message.type, text: block && 'text' in block ? String(block.text) : '' })
-    return { deny: '测试里不落盘' }
+    return opts.appendOk ? next(e) : { deny: '测试里不落盘' }
   })
 
   return w
@@ -219,8 +219,8 @@ test('开关没开：过线也不发', async ($, on) => {
   expect(w.submits).toEqual([])
 })
 
-// 测试工具里插件自己的 session.append 到不了测试的钩子（报 no implementation），
-// 插话成功那条路只能在真的 Claude Code 里验；这里正好测插不进去时退回排队、话不丢
+// 插话被拒（测试里的 session.append 钩子回 deny）时退回排队、话不丢
+// （2.1.301 起插件自己的 session.append 到得了测试的钩子；以前报 no implementation）
 test('干活中途过线：插不进去就改为排队发，不丢', async ($, on) => {
   const w = world(on, CFG)
   await $.session.start(START)
@@ -230,7 +230,7 @@ test('干活中途过线：插不进去就改为排队发，不丢', async ($, o
   await $.session.measure(measure(120_000, 95))
 
   expect(w.toasts).toEqual([
-    '到线提醒插话没插进去（no implementation for session.append），改为这一轮结束后发',
+    '到线提醒插话没插进去（测试里不落盘），改为这一轮结束后发',
   ])
   expect(w.submits).toEqual(['【到线提醒】上下文 120k，到了 100k 的线。收尾'])
 
@@ -242,6 +242,29 @@ test('干活中途过线：插不进去就改为排队发，不丢', async ($, o
     reason: 'answer',
   })
   expect(w.submits.length).toBe(1)
+})
+
+// 2.1.300 起 turn.start 钩子也听得到子 agent 的回合（带 agentId）；
+// 子 agent 的回合不能顶掉主线程的那一轮，否则插话没被读到时的补发对不上号、话丢
+test('干活中途有子 agent 开了回合：插话没被读到，主线程这一轮结束照样补发', async ($, on) => {
+  const w = world(on, CFG, { appendOk: true })
+  await $.session.start(START)
+  await $.session.measure(measure(50_000))
+  await $.turn.start({ text: 'go', turnId: 't1' })
+  await $.turn.start({ text: 'sub', turnId: 't2', agentId: 'a1' })
+  await $.session.measure(measure(120_000))
+
+  expect(w.appends[0]?.text).toBe('【到线提醒】上下文 120k，到了 100k 的线。收尾')
+  expect(w.submits).toEqual([])
+
+  await $.turn.complete({
+    answer: '',
+    durationMs: 1,
+    isAborted: false,
+    turnId: 't1',
+    reason: 'answer',
+  })
+  expect(w.submits).toEqual(['【到线提醒】上下文 120k，到了 100k 的线。收尾'])
 })
 
 for (const surface of ['terminal', 'desktop'] as const) {

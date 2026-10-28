@@ -667,7 +667,9 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
+  // 2.1.300 起子 agent / 队友的回合也会走到这里；只认主线程的那一轮（turn.step / turn.complete 同理）
   on('turn.start', async ($, e, next) => {
+    if (e.agentId !== undefined) return next(e)
     await update($, flow, f => ({ ...f, turn: { id: e.turnId, step: -1 } }))
     return next(e)
   })
